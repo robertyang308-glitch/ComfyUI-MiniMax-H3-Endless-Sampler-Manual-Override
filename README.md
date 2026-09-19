@@ -211,6 +211,15 @@ inside one chunk. Sampler time was 5 min 45 s on an RTX 5090 at 864x480,
 3 steps; peak VRAM 26.6 GiB. See its README for the full statistics and
 the rule for writing a cut at a chunk boundary.
 
+![Preview from the example run](examples/one_minute_train/stills/preview.gif)
+
+| `<Picture 1>` | `<Picture 2>` | `<Picture 3>` | Result, every two seconds |
+|---|---|---|---|
+| <img src="examples/one_minute_train/refs/picture_1_traveller.png" width="120"> | <img src="examples/one_minute_train/refs/picture_2_conductor.png" width="120"> | <img src="examples/one_minute_train/refs/picture_3_carriage.png" width="160"> | <img src="examples/one_minute_train/stills/contact_sheet.jpg" width="420"> |
+
+Full video: [`examples/one_minute_train/output.mp4`](examples/one_minute_train/output.mp4) ·
+Prompt: [`examples/one_minute_train/prompt.txt`](examples/one_minute_train/prompt.txt)
+
 ---
 
 ## Install
