@@ -201,6 +201,18 @@ why many small chunks render more slowly than a few large ones.
 
 ---
 
+## Example
+
+`examples/one_minute_train/` contains a complete one-minute run: the
+`full_prompt` document, the three reference images with the prompts used
+to make them, and the rendered video. Nine chunks with spans from 73 to
+226 frames, cuts placed on chunk boundaries, and a dialogue exchange kept
+inside one chunk. Sampler time was 5 min 45 s on an RTX 5090 at 864x480,
+3 steps; peak VRAM 26.6 GiB. See its README for the full statistics and
+the rule for writing a cut at a chunk boundary.
+
+---
+
 ## Install
 
 Replace `custom_nodes/ComfyUI-HR-Endless-Sampler/` with this fork, or apply

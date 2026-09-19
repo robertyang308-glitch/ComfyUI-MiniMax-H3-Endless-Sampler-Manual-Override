@@ -1,0 +1,50 @@
+Endless Sampler fork - file manifest
+====================================
+
+Copy these over your ComfyUI-HR-Endless-Sampler folder, keeping every
+other upstream file (gemma4.py, vendor/, web/, tests/, LICENSE, etc.)
+in place. Only these four .py files differ from upstream.
+
+  nodes.py       sampler, chunk planning, manual chunk descriptions
+  __init__.py    node registration (adds the Advanced node)
+  preview.py     display name only
+  video_io.py    display names only
+  README.md      fork documentation
+  docs/          prompt guides and the header checker
+
+After restarting, the node list should show:
+
+  Endless Sampler
+  Endless Sampler (Advanced)      <- new in this fork
+  Endless Sampler Preview
+  Endless Sampler Save Video
+  Endless Sampler Load Video
+
+If "Endless Sampler (Advanced)" is missing, __init__.py did not get
+copied. If the names still start with "HR ", none of these did.
+
+Advanced node inputs that do not exist upstream:
+
+  chunk_descriptions              per-chunk description blocks, --- separated
+  ref_video                       frames of a video reference, for rebuilding
+  free_encoders_before_sampling   release TE and VAE before H3 samples
+  validate_only                   plan and report, sample nothing
+
+Advanced node output that does not exist upstream:
+
+  chunk_description_log
+
+Headers honoured inside chunk_descriptions (Advanced only):
+
+  # chunk_frames = 209, 209, 192
+  # context_keyframes = 5, 22, 5
+
+Logging added in this fork, visible in the console:
+
+  chunk N/M START | frames a-b (span s) | latent steps t | trim x | free=...
+  chunk N/M eval k | free=... alloc=... peak=...
+  chunk N/M DONE | ...s | delivered frames a-b | free=...
+
+Every one of those lines is flushed and fsynced, so they survive a
+native crash. If a run dies and you see no such lines, an older
+nodes.py is installed.

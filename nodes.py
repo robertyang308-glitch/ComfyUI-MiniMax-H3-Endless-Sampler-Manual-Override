@@ -12,6 +12,7 @@
 import hashlib
 import json
 import logging
+import os
 import math
 import re
 import shutil
@@ -589,6 +590,34 @@ def _parse_header_numbers(text, key, pattern):
     return numbers[0] if len(numbers) == 1 else numbers
 
 
+# A boundary line: "#" plus the word chunks, optionally dashed. It must not
+# match the "# chunks = 3" header, so an equals sign disqualifies it.
+FULL_PROMPT_BOUNDARY = re.compile(r"(?im)^[ \t]*#[ \t-]*chunks[ \t-]*$")
+
+
+def _split_full_prompt(text):
+    """Split a combined document into (base prompt, chunk blocks).
+
+    The base prompt comes first, then a boundary line such as
+    ``# ---- chunks ----``, then the per-chunk description blocks separated
+    by ``---`` as usual. Returns None when no boundary is present, so the
+    caller can report a usable error rather than guessing.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    match = FULL_PROMPT_BOUNDARY.search(text)
+    if match is None:
+        return None
+    # Comment lines carry the layout headers and must not reach H3, so they
+    # are stripped from the base prompt. The headers themselves are read from
+    # the whole document by the caller, wherever in it they were written.
+    base_lines = [line for line in text[:match.start()].splitlines()
+                  if not line.lstrip().startswith("#")]
+    base = "\n".join(base_lines).strip()
+    blocks = text[match.end():].lstrip("\r\n")
+    return base, blocks
+
+
 def _parse_header_chunk_frames(text):
     return _parse_header_numbers(text, "chunk_frames", MANUAL_HEADER_CHUNK_FRAMES)
 
@@ -955,12 +984,39 @@ def _reference_image(image, width, height):
     return _resize(image, target_width, target_height, "disabled")
 
 
-def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items=()):
+def _video_reference_item(frames, fps=VIDEO_FPS):
+    """Build a Qwen video reference item from supplied pixel frames.
+
+    Mirrors _decoded_video_item, but takes frames directly instead of
+    decoding a latent, so a video reference can be rebuilt for the text
+    encoder on every chunk without the sampler ever holding its latent.
+    Sampling stride and the pixel cap match the decode path exactly.
+    """
+    stride = max(1, int(round(fps)) // 2)
+    sample_indices = list(range(0, frames.shape[0], stride))
+    sampled = frames[sample_indices]
+    height, width = sampled.shape[1:3]
+    if height * width > QWEN_VIDEO_MAX_PIXELS:
+        scale = math.sqrt(QWEN_VIDEO_MAX_PIXELS / (height * width))
+        target_width = max(CANVAS_MULTIPLE, round(width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        target_height = max(CANVAS_MULTIPLE, round(height * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        sampled = _resize(sampled, target_width, target_height, "disabled")
+    return {
+        "type": "video",
+        "data": sampled,
+        "timestamps": [index / 2.0 for index in range(len(sample_indices))],
+    }
+
+
+def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items=(),
+                   ref_video=None, ref_video_fps=VIDEO_FPS):
     refs = positive[0].get("minimax_refs") if positive else None
     image_list = [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
     if refs:
         ref_items = []
         image_index = 0
+        skipped_video_refs = 0
+        video_ref_used = False
         for ref in refs:
             kind = ref["kind"]
             if kind == "image":
@@ -970,10 +1026,51 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, 
                 image_index += 1
             elif kind == "audio":
                 ref_items.append({"type": "audio"})
+            elif kind in ("video", "video_audio") and ref_video is not None and not video_ref_used:
+                # ComfyUI's native video+soundtrack presentation emits the
+                # audio label immediately before the matching video label.
+                if kind == "video_audio":
+                    ref_items.append({"type": "audio"})
+                ref_items.append(_video_reference_item(ref_video, ref_video_fps))
+                video_ref_used = True
             elif kind in ("video", "video_audio"):
-                raise ValueError("HR Endless Sampler cannot rebuild video Ref2VA conditioning from an images input")
+                # A video-kind ref cannot be rebuilt for the Qwen side: that
+                # needs decoded pixels, and only the latent reaches the
+                # sampler. Skip it rather than fail. The ref itself is not
+                # lost - `minimax_refs` on the conditioning is left untouched,
+                # so the DiT still attends to it in every chunk. Latent-only
+                # refs such as MiniMaxH3Mod RefMods never had a Qwen side to
+                # begin with, so this matches their unchunked behaviour. A
+                # native Ref2VA video reference does lose its Qwen tokens
+                # here, keeping only its DiT attention.
+                skipped_video_refs += 1
         if image_index != len(image_list):
-            raise ValueError("HR Endless Sampler received more images than the Ref2VA conditioning uses")
+            kinds = {}
+            for ref in refs:
+                kind = ref.get("kind", "image")
+                kinds[kind] = kinds.get(kind, 0) + 1
+            summary = ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items()))
+            raise ValueError(
+                f"HR Endless Sampler received {len(image_list)} image(s) but the "
+                f"Ref2VA conditioning only uses {image_index}.\n"
+                f"  conditioning references: {summary}\n"
+                f"  The images input exists so image references can be rebuilt for "
+                f"the text encoder on every chunk, so it must contain exactly the "
+                f"images those references use, in the same order.\n"
+                f"  Latent-only references such as MiniMaxH3Mod RefMods carry their "
+                f"own data and need no image here.\n"
+                f"  It is not an input for source video: to drive the sampler from "
+                f"an existing video, encode it and feed it as the latent instead."
+            )
+        if video_ref_used:
+            logging.info(
+                "HR Endless Sampler: rebuilt 1 video reference for the text encoder "
+                "from the ref_video input.")
+        if skipped_video_refs:
+            logging.info(
+                "HR Endless Sampler: %d video reference(s) were not rebuilt for the "
+                "text encoder; they remain active through the model's own reference "
+                "attention.", skipped_video_refs)
         ref_items.extend(video_items)
         return clip.tokenize(prompt, minimax_ref_items=ref_items)
 
@@ -986,8 +1083,9 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, 
     return clip.tokenize(prompt, images=prompt_images)
 
 
-def _encode_prompt(clip, prompt, images, positive, width, height, continuation, video_items=()):
-    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items))
+def _encode_prompt(clip, prompt, images, positive, width, height, continuation, video_items=(),
+                   ref_video=None, ref_video_fps=VIDEO_FPS):
+    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items, ref_video, ref_video_fps))
     if len(conditioning) != 1:
         raise ValueError("HR Endless Sampler expects one MiniMax H3 conditioning segment")
     return conditioning[0]
@@ -1274,6 +1372,51 @@ def _memory_backend(device):
     return None
 
 
+def _flush_logs():
+    """Force every log handler to disk.
+
+    Python buffers file logging, and a native crash - an illegal instruction,
+    a CUDA abort, an OOM kill - ends the process without flushing. The last
+    lines before a crash are exactly the ones worth having, so they are
+    fsynced rather than left in a buffer. Without this, a conclusion about
+    *where* a run died can be an artifact of a lost buffer rather than a fact.
+    """
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+            stream = getattr(handler, "stream", None)
+            if stream is not None and hasattr(stream, "fileno"):
+                os.fsync(stream.fileno())
+        except (OSError, ValueError):
+            pass
+
+
+def _vram_snapshot(device):
+    """(free, allocated, peak) in GiB, or None off CUDA.
+
+    Free comes from the driver, so it counts memory held outside PyTorch's
+    own accounting - which is where offloaded weights and other allocators
+    live, and where the surprises usually are.
+    """
+    backend = _memory_backend(device)
+    if backend is None or getattr(device, "type", None) != "cuda":
+        return None
+    try:
+        free, _total = backend.mem_get_info(device)
+        return (free / 1024 ** 3,
+                backend.memory_allocated(device) / 1024 ** 3,
+                backend.max_memory_allocated(device) / 1024 ** 3)
+    except Exception:
+        return None
+
+
+def _vram_suffix(device):
+    snapshot = _vram_snapshot(device)
+    if snapshot is None:
+        return ""
+    return " | free={:.2f} alloc={:.2f} peak={:.2f} GiB".format(*snapshot)
+
+
 def _vram_report(stage, device, components=(), tensors=None):
     mib = 1024 ** 2
     total = comfy.model_management.get_total_memory(device)
@@ -1384,12 +1527,23 @@ class _VRAMMonitor:
     def __call__(self, executor, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options=None, **kwargs):
         self.call += 1
         label = f"chunk {self.chunk + 1}/{self.chunk_count} DiT evaluation {self.call}"
+        # One compact line per evaluation, flushed. Collapsing free VRAM
+        # across the first evaluations is the signature worth catching, and
+        # it has to survive a process that dies without unwinding.
+        logging.info("HR Endless Sampler chunk %d/%d eval %d%s",
+                     self.chunk + 1, self.chunk_count, self.call,
+                     _vram_suffix(self.device))
+        _flush_logs()
         tensors = {"model input": x, "cross attention": c_crossattn, "model conditions": kwargs}
         self.report(label + " before", tensors, sample_group="dit")
         try:
             result = executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
         except Exception:
             self.report(label + " FAILED", tensors, sample_group="dit")
+            logging.error("HR Endless Sampler chunk %d/%d eval %d FAILED%s",
+                          self.chunk + 1, self.chunk_count, self.call,
+                          _vram_suffix(self.device))
+            _flush_logs()
             if self.debug and self.device.type == "cuda":
                 logging.info("HR Endless Sampler CUDA allocator after failure:\n%s", torch.cuda.memory_summary(self.device, abbreviated=True))
             raise
@@ -1900,6 +2054,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
     @classmethod
     def define_schema(cls):
         advanced_inputs = [
+            io.String.Input("full_prompt", optional=True, multiline=True, default="",
+                            tooltip="Base prompt and per-chunk blocks in one document. Base prompt first, then a line reading '# ---- chunks ----', then the blocks separated by lines of three dashes. Only used when use_full_prompt is on, and then the prompt and chunk_descriptions widgets are ignored."),
+            io.Boolean.Input("use_full_prompt", default=False,
+                             tooltip="Take the base prompt and the chunk blocks from full_prompt instead of the prompt and chunk_descriptions widgets. Off by default so nothing changes unless you ask for it."),
+            io.Image.Input("ref_video", optional=True,
+                           tooltip="Frames of a video reference held in the conditioning, so it can be rebuilt for the text encoder on every chunk. Without this a video reference still drives the model's own reference attention, but the text encoder does not see it. Audio references need nothing here: their text-encoder token carries no data."),
+            io.Boolean.Input("free_encoders_before_sampling", default=False,
+                             tooltip="Release the Qwen text encoder and the VAE from VRAM after conditioning each chunk and before H3 samples it. With dynamic VRAM enabled ComfyUI keeps them resident and streams H3's weights instead, which is slower. They are reloaded on the next chunk, which happens anyway. Try this if steps are slow and free VRAM is low."),
             io.Boolean.Input("validate_only", default=False,
                              tooltip="Plan and validate only: check the chunk layout, spans, overlaps and chunk_descriptions block count, then return without sampling. No model is loaded for sampling."),
         ] if cls.ADVANCED else []
@@ -1965,7 +2127,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
-                video_continuation=5, vae=None, chunk_descriptions="", validate_only=False,
+                video_continuation=5, vae=None, chunk_descriptions="", full_prompt="",
+                use_full_prompt=False, ref_video=None,
+                free_encoders_before_sampling=False, validate_only=False,
                 cache_gemma_preproduction=False,
                 gemma4_mtp=True,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0,
@@ -2008,10 +2172,35 @@ class HREndlessSampler(SamplerCustomAdvanced):
         video_continuation = int(video_continuation_enable) * video_continuation
         max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
         requested_video_continuation = video_continuation
+        if cls.ADVANCED and use_full_prompt:
+            split = _split_full_prompt(full_prompt)
+            if split is None:
+                raise ValueError(
+                    "use_full_prompt is on but full_prompt has no chunk boundary. "
+                    "Put the base prompt first, then a line reading '# ---- chunks ----', "
+                    "then the per-chunk blocks separated by lines of three dashes. "
+                    "Turn use_full_prompt off to use the prompt and chunk_descriptions "
+                    "widgets instead."
+                )
+            prompt, chunk_descriptions = split
+            # Headers may sit above the boundary, so read them from the whole
+            # document rather than from the blocks alone.
+            header_source = full_prompt
+            if not prompt.strip():
+                raise ValueError(
+                    "full_prompt has nothing before the chunk boundary. The base prompt "
+                    "supplies subject_definitions, overall_soundscape and the rest, which "
+                    "are kept for every chunk."
+                )
+            logging.info(
+                "HR Endless Sampler: using full_prompt; the prompt and chunk_descriptions "
+                "widgets are ignored for this run.")
+
+        header_source = locals().get("header_source", chunk_descriptions)
         header_chunk_frames = (
-            _parse_header_chunk_frames(chunk_descriptions) if cls.ADVANCED else None)
+            _parse_header_chunk_frames(header_source) if cls.ADVANCED else None)
         header_context_keyframes = (
-            _parse_header_context_keyframes(chunk_descriptions) if cls.ADVANCED else None)
+            _parse_header_context_keyframes(header_source) if cls.ADVANCED else None)
         chunk_frames_source = "node widget"
         if isinstance(header_chunk_frames, int):
             chunk_frames = header_chunk_frames
@@ -2662,6 +2851,21 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 gemma_chunk_seconds = 0.0
                 h3_render_seconds = 0.0
                 vram_monitor.set_chunk(index)
+                # Emitted BEFORE the chunk does anything, and flushed, so a
+                # chunk that dies still leaves its own starting state on disk.
+                # The run report only prints on completion, which is no use
+                # for the chunk that failed.
+                _chunk_span = chunk["frame_end"] - chunk["frame_start"]
+                _chunk_latent_t = chunk["video_end"] - chunk["video_start"]
+                logging.info(
+                    "HR Endless Sampler chunk %d/%d START | frames %d-%d (span %d) | "
+                    "latent steps %d | trim %d%s",
+                    index + 1, len(active_plan),
+                    chunk["frame_start"], chunk["frame_end"] - 1, _chunk_span,
+                    _chunk_latent_t, chunk.get("output_trim_frames", 0),
+                    _vram_suffix(vram_monitor.device),
+                )
+                _flush_logs()
                 vram_monitor.report(
                     f"chunk {index + 1}/{len(active_plan)} start",
                     {
@@ -3048,7 +3252,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     preview_execution.set_phase(qwen_message, chunk=index)
                 timer_started = time.perf_counter()
                 try:
-                    encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation, video_items)
+                    encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height,
+                                                    continuation, video_items, ref_video, fps)
                 finally:
                     timing.add("qwen", timer_started)
                 del video_items
@@ -3109,6 +3314,29 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         gemma_description,
                     )
                 try:
+                    if free_encoders_before_sampling:
+                        # ComfyUI's loader evicts nothing while it can partially
+                        # load and stream instead, so with dynamic VRAM the text
+                        # encoder and VAE stay resident and H3 streams its weights
+                        # for every step. Releasing them here mirrors what the
+                        # Gemma path already does, and gives H3 the whole card.
+                        # They are reloaded next chunk, but they were being
+                        # reloaded every chunk anyway.
+                        before = _vram_snapshot(vram_monitor.device)
+                        comfy.model_management.unload_model_and_clones(clip.patcher)
+                        if vae is not None:
+                            comfy.model_management.unload_model_and_clones(vae.patcher)
+                        comfy.model_management.soft_empty_cache(force=True)
+                        after = _vram_snapshot(vram_monitor.device)
+                        if before and after:
+                            logging.info(
+                                "HR Endless Sampler: released text encoder and VAE before "
+                                "sampling | free %.2f -> %.2f GiB (+%.2f)",
+                                before[0], after[0], after[0] - before[0])
+                        else:
+                            logging.info("HR Endless Sampler: released text encoder and VAE "
+                                         "before sampling.")
+                        _flush_logs()
                     sampling_message = f"{chunk_label}: starting H3 inference"
                     logging.info("HR Endless Sampler: %s.", sampling_message)
                     if preview_execution is not None:
@@ -3170,6 +3398,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 chunk_progress.finish(index)
                 completed_chunks = index + 1
                 chunk_total_seconds = timing.finish_chunk(index) or 0.0
+                # Written per chunk rather than accumulated for the end, so an
+                # interrupted run still leaves a per-chunk record behind.
+                logging.info(
+                    "HR Endless Sampler chunk %d/%d DONE | %.1fs (H3 %.1fs) | "
+                    "delivered frames %d-%d%s",
+                    index + 1, len(active_plan), chunk_total_seconds,
+                    h3_render_seconds,
+                    chunk["frame_start"] + chunk.get("output_trim_frames", 0),
+                    chunk["frame_end"] - 1,
+                    _vram_suffix(vram_monitor.device),
+                )
+                _flush_logs()
                 chunk_preproduction_seconds = gemma_preproduction_seconds if index == 0 else 0.0
                 chunk_gemma_seconds = gemma_chunk_seconds + chunk_preproduction_seconds
                 # The one-time shot planner exists to prepare Chunk 1, so
